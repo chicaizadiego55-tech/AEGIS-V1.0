@@ -1,0 +1,473 @@
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include "BluetoothSerial.h" 
+#include "DFRobot_HuskylensV2.h" 
+#include "DFRobotDFPlayerMini.h"
+
+// ==========================================
+// 1. CREACIÓN DE OBJETOS DE HARDWARE
+// ==========================================
+BluetoothSerial SerialBT; 
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+HuskylensV2 huskylens; 
+HardwareSerial mySerial2(2); 
+DFRobotDFPlayerMini myDFPlayer;
+
+// ==========================================
+// 2. VARIABLES GLOBALES (IA, Audio y Estado)
+// ==========================================
+char modoActual = 'H'; 
+int ultimoID = -1; 
+unsigned long tiempoUltimoAudio = 0; 
+unsigned long tiempoUltimoVisto = 0;
+unsigned long duracionBloqueo = 1000; 
+bool accionEjecutada = false; 
+bool huskyActivo = false; 
+
+// ==========================================
+// 3. VARIABLES DE LOCOMOCIÓN Y SERVOS
+// ==========================================
+unsigned long tiempoUltimoReporte = 0;
+#define SERVOMIN 100
+#define SERVOMAX 640
+
+// Canales PCA9685
+const int B_FR=0, F_FR=1, T_FR=2;
+const int B_FL=3, F_FL=4, T_FL=5;
+const int B_RR=6, F_RR=7, T_RR=8;
+const int B_RL=9, F_RL=10, T_RL=11;
+
+// Ángulos base calibrados
+int fr_B = 140; int fr_F = 90;  int fr_T = 210;
+int fl_B = 135; int fl_F = 180; int fl_T = 50;
+int rr_B = 130; int rr_F = 80;  int rr_T = 225;
+int rl_B = 140; int rl_F = 180; int rl_T = 45;
+float maxAngulos[12] = {270,270,270,270,270,270,270,270,270,270,270,270};
+
+// --- NUEVAS VARIABLES AGREGADAS PARA EL FILTRO DE SUAVIDAD ---
+float alpha = 0.1;           // Factor de filtrado (0.1 = Muy suave)
+float smoothAngles[12];      // Almacena el valor suavizado de cada uno de los 12 servos
+
+// Parámetros de marcha
+int PERIODO = 1000;  
+int LIFT    = 20;    
+int STRIDE  = 12; 
+int TURN    = 10; 
+
+int estado = 0; // 0:stop, 1:adelante, 2:atras, 3:izquierda, 4:derecha, 5:mano
+float currentAngles[12];
+
+// ==========================================
+// SETUP PRINCIPAL
+// ==========================================
+void setup() {
+  Serial.begin(115200); 
+  Wire.begin(); 
+  mySerial2.begin(9600, SERIAL_8N1, 16, 17); 
+  SerialBT.begin("AEGIS"); 
+  pwm.begin();
+  pwm.setPWMFreq(50);
+  
+  if (!huskylens.begin(Wire)) { 
+    Serial.println("⚠️ ALERTA: HuskyLens NO detectada. El robot caminará ciego.");
+    huskyActivo = false;
+  } else {
+    Serial.println("✅ HuskyLens conectada correctamente.");
+    huskylens.switchAlgorithm(ALGORITHM_HAND_RECOGNITION);
+    huskyActivo = true;
+  }
+  
+  // Inicializa Módulo de Voz (DFPlayer)
+  Serial.println("🔊 Iniciando MP3...");
+  if (!myDFPlayer.begin(mySerial2)) {  
+  } else {
+    myDFPlayer.volume(29); 
+  }
+  
+  // --- NUEVO: Inicializar el array de suavizado con las posiciones base para evitar sacudidas ---
+  smoothAngles[B_FR] = fr_B; smoothAngles[F_FR] = fr_F; smoothAngles[T_FR] = fr_T;
+  smoothAngles[B_FL] = fl_B; smoothAngles[F_FL] = fl_F; smoothAngles[T_FL] = fl_T;
+  smoothAngles[B_RR] = rr_B; smoothAngles[F_RR] = rr_F; smoothAngles[T_RR] = rr_T;
+  smoothAngles[B_RL] = rl_B; smoothAngles[F_RL] = rl_F; smoothAngles[T_RL] = rl_T;
+
+  standUp(); 
+  Serial.println("✅ JOYS_V1 Listo para operar. Iniciando en Modo Mascota (H).");
+}
+
+// ==========================================
+// BUCLE PRINCIPAL (LOOP)
+// ==========================================
+void loop() {
+  
+  // 1. LEER COMANDOS BLUETOOTH
+  if (SerialBT.available()) {
+    char dato = SerialBT.read();
+    procesarBT(dato);
+  }
+
+  // 2. PROCESAR LA VISIÓN (Solo ejecuta si hay un modo válido)
+  if (modoActual != '0' && huskyActivo == true) {
+    procesarVision();
+  }
+
+  // 3. EJECUTAR LA MARCHA
+  switch(estado) {
+    case 1: trotStepRecto();     break;
+    case 2: trotStepAtras();     break;
+    case 3: trotStepIzquierda(); break;
+    case 4: trotStepDerecha();   break;
+    case 5: sentarseYDarMano();  break; 
+  }
+
+  // 4. TELEMETRÍA (Monitor Serie para depuración)
+  if (millis() - tiempoUltimoReporte > 1000) {
+    imprimirSenales();
+    tiempoUltimoReporte = millis();
+  }
+}
+
+// ==========================================
+// PROCESAMIENTO DE BLUETOOTH UNIFICADO
+// ==========================================
+void procesarBT(char c) {
+  c = toupper(c);
+  
+  // --- COMANDOS DE LOCOMOCIÓN ---
+  if (c == 'F') { estado = 1; }
+  else if (c == 'X') { estado = 2; }
+  else if (c == 'L') { estado = 3; }
+  else if (c == 'R') { estado = 4; }
+  else if (c == 'S') { estado = 0; standUp(); }
+  
+  // --- COMANDOS DE INTELIGENCIA MULTIMODAL ---
+  else if (c == 'A') {
+    modoActual = 'A';
+    huskylens.switchAlgorithm(ALGORITHM_FACE_RECOGNITION);
+    ultimoID = -1; 
+    Serial.println("🔄 CAMBIO A FASE 1: Rostros");
+  } 
+  else if (c == 'B') {
+    modoActual = 'B';
+    huskylens.switchAlgorithm(ALGORITHM_COLOR_RECOGNITION);
+    ultimoID = -1;
+    Serial.println("🔄 CAMBIO A FASE 2: Colores");
+  }
+  else if (c == 'D') {
+    modoActual = 'D';
+    huskylens.switchAlgorithm(ALGORITHM_SELF_LEARNING_CLASSIFICATION);
+    ultimoID = -1;
+    Serial.println("🔄 CAMBIO A FASE 4: Reciclaje");
+  }
+  else if (c == 'H') {
+    modoActual = 'H';
+    huskylens.switchAlgorithm(ALGORITHM_HAND_RECOGNITION);
+    ultimoID = -1;
+    accionEjecutada = false;
+    Serial.println("🔄 CAMBIO A FASE 0: Mascota (Manos)");
+  }
+  
+  // --- COMANDOS ESPECIALES DE AUDIO DIRECTO ---
+  else if (c == 'C') {
+    Serial.println("🔊 BOTÓN PRESIONADO: Reproduciendo Discurso Final (Audio 26)");
+    myDFPlayer.play(26);
+    
+    // Protegemos el audio para que la cámara no lo corte
+    tiempoUltimoAudio = millis(); 
+    duracionBloqueo = 18000; // 18 segundos de bloqueo visual
+  }
+}
+
+// ==========================================
+// CEREBRO DE VISIÓN Y AUDIO DINÁMICO
+// ==========================================
+void procesarVision() {
+  eAlgorithm_t algoritmoActual;
+  
+  if (modoActual == 'A') algoritmoActual = ALGORITHM_FACE_RECOGNITION;
+  else if (modoActual == 'B') algoritmoActual = ALGORITHM_COLOR_RECOGNITION;
+  else if (modoActual == 'C') algoritmoActual = ALGORITHM_OBJECT_CLASSIFICATION;
+  else if (modoActual == 'D') algoritmoActual = ALGORITHM_SELF_LEARNING_CLASSIFICATION;
+  else if (modoActual == 'H') algoritmoActual = ALGORITHM_HAND_RECOGNITION;
+  else return; 
+
+  if (huskylens.getResult(algoritmoActual)) {
+    int cantidad = huskylens.available(algoritmoActual); 
+    
+    if (cantidad > 0) {
+      tiempoUltimoVisto = millis(); 
+      
+      Result *result = static_cast<Result *>(huskylens.popCachedResult(algoritmoActual));
+      
+      // --- LÓGICA EXCLUSIVA PARA DAR LA MANO (Modo H) ---
+      if (modoActual == 'H') {
+        if (result->ID == 1 && !accionEjecutada) {
+          estado = 5; 
+          accionEjecutada = true;
+        } else if (result->ID == 0) {
+          accionEjecutada = false; 
+        }
+      }
+      
+      // --- LÓGICA DIDÁCTICA Y DE AUDIO (Modos A, B, C, D) ---
+      else if (result->ID != ultimoID && (millis() - tiempoUltimoAudio > duracionBloqueo)) {
+        
+        ultimoID = result->ID; 
+        tiempoUltimoAudio = millis(); 
+        duracionBloqueo = 3500; 
+
+        if (modoActual == 'A') {
+          if (result->ID == 1) { duracionBloqueo = 4000; myDFPlayer.play(1); }
+          else if (result->ID == 2) { duracionBloqueo = 4000; myDFPlayer.play(2); }
+          else if (result->ID == 3) { duracionBloqueo = 4000; myDFPlayer.play(3); }
+          else if (result->ID == 0) { duracionBloqueo = 4000; myDFPlayer.play(4); } 
+        }
+        else if (modoActual == 'B') {
+          if (result->ID == 1) { myDFPlayer.play(5); }
+          else if (result->ID == 2) { myDFPlayer.play(6); }
+          else if (result->ID == 3) { myDFPlayer.play(7); }
+          else if (result->ID == 4) { myDFPlayer.play(8); }
+          else if (result->ID == 5) { myDFPlayer.play(9); }
+          else if (result->ID == 6) { myDFPlayer.play(10); }
+        }
+        else if (modoActual == 'D') {
+          if (result->ID == 1) { duracionBloqueo = 20000; myDFPlayer.play(11); }
+          else if (result->ID == 3) { myDFPlayer.play(12); }
+          else if (result->ID == 6) { myDFPlayer.play(13); }
+          else if (result->ID == 7) { myDFPlayer.play(14); }
+          else if (result->ID == 11) { myDFPlayer.play(15); }
+          else if (result->ID == 31) { myDFPlayer.play(25); }
+          else if (result->ID == 13) { duracionBloqueo = 5000; myDFPlayer.play(17); }
+          else if (result->ID == 25) { duracionBloqueo = 5000; myDFPlayer.play(18); }
+          else if (result->ID == 15) { duracionBloqueo = 5000; myDFPlayer.play(19); }
+        }
+      }
+      
+      while(huskylens.available(algoritmoActual)) { 
+        huskylens.popCachedResult(algoritmoActual); 
+      }
+      
+    } else {
+      // --- NUEVO: Reseteo correcto ---
+      // Si la cámara ve CERO objetos por 2 segundos, limpia la memoria
+      if (millis() - tiempoUltimoVisto > 2000) { 
+        ultimoID = -1; 
+      }
+    }
+  }
+}
+
+void imprimirSenales() {
+  Serial.print("Modo IA: "); Serial.print(modoActual);
+  Serial.print(" | Locomoción: "); Serial.println(estado);
+}
+
+// ==========================================
+// FUNCIONES MECÁNICAS Y ANIMACIONES
+// ==========================================
+
+// MODIFICADO: Ahora aplica el filtro matemático antes de generar el pulso PWM
+void setServo(uint8_t canal, float angulo) {
+  if (angulo < 0) angulo = 0;
+  if (angulo > maxAngulos[canal]) angulo = maxAngulos[canal];
+  currentAngles[canal] = angulo; 
+
+  // --- Aplicación de Filtro de Media Móvil Exponencial (Tus bloques) ---
+  smoothAngles[canal] = round((alpha * angulo) + ((1.0 - alpha) * smoothAngles[canal]));
+
+  uint16_t pulso = SERVOMIN + (smoothAngles[canal] / maxAngulos[canal]) * (SERVOMAX - SERVOMIN);
+  pwm.setPWM(canal, 0, pulso);
+}
+
+void standUp() {
+  setServo(B_FR,fr_B); setServo(F_FR,fr_F); setServo(T_FR,fr_T);
+  setServo(B_FL,fl_B); setServo(F_FL,fl_F); setServo(T_FL,fl_T);
+  setServo(B_RR,rr_B); setServo(F_RR,rr_F); setServo(T_RR,rr_T);
+  setServo(B_RL,rl_B); setServo(F_RL,rl_F); setServo(T_RL,rl_T);
+}
+
+// MODIFICADO: Aplica el filtro en los pasos intermedios de las marchas para máxima fluidez
+void moverGrupo(int targets[], int duracion) {
+  unsigned long startTime = millis();
+  float startAngles[12];
+  for(int i=0; i<12; i++) startAngles[i] = currentAngles[i];
+
+  while (millis() - startTime < (unsigned long)duracion) {
+    float progreso = (float)(millis() - startTime) / duracion;
+    float suave = (1.0 - cos(progreso * PI)) / 2.0; 
+
+    for (int i = 0; i < 12; i++) {
+      if (targets[i] != -1) {
+        float angIntermedio = startAngles[i] + (targets[i] - startAngles[i]) * suave;
+        
+        // --- Aplicación de Filtro de Media Móvil Exponencial (Tus bloques) ---
+        smoothAngles[i] = round((alpha * angIntermedio) + ((1.0 - alpha) * smoothAngles[i]));
+
+        uint16_t pulso = SERVOMIN + (smoothAngles[i] / maxAngulos[i]) * (SERVOMAX - SERVOMIN);
+        pwm.setPWM(i, 0, pulso);
+        currentAngles[i] = angIntermedio;
+      }
+    }
+    
+    // --- FILTRADO INTELIGENTE DE BLUETOOTH ---
+    if (SerialBT.available()) {
+      char siguienteComando = toupper(SerialBT.peek()); 
+      
+      // Si el comando que viene es el mismo movimiento, lo consumimos
+      if ((estado == 1 && siguienteComando == 'F') ||
+          (estado == 2 && siguienteComando == 'X') ||
+          (estado == 3 && siguienteComando == 'L') ||
+          (estado == 4 && siguienteComando == 'R')) {
+        SerialBT.read(); 
+      } 
+      else {
+        // Si viene algo diferente, salimos para reaccionar
+        return; 
+      }
+    }
+    
+    // --- CORRECCIÓN DE SUPERVIVENCIA AQUÍ ---
+    // Solo intenta mirar si hay un modo activo Y la cámara realmente está conectada
+    if (modoActual != '0' && huskyActivo == true) {
+      procesarVision(); 
+    }
+  }
+}
+
+void setTargets(int t[], int val) {
+  for(int i=0; i<12; i++) t[i] = val;
+}
+
+void sentarseYDarMano() {
+  int t[12];
+  int vel = 600; 
+
+  setTargets(t, -1);
+  t[F_RR] = rr_F - 40;  
+  t[T_RR] = rr_T + 50;  
+  t[F_RL] = rl_F + 40;  
+  t[T_RL] = rl_T - 50;  
+  moverGrupo(t, vel);
+  if (SerialBT.available()) return; 
+  delay(200); 
+
+  setTargets(t, -1);
+  t[F_FR] = fr_F + 50;  
+  t[T_FR] = fr_T + 20;  
+  moverGrupo(t, vel);
+  if (SerialBT.available()) return;
+
+  for (int i = 0; i < 2; i++) { 
+    setTargets(t, -1);
+    t[F_FR] = fr_F + 70; 
+    moverGrupo(t, 250);
+    if (SerialBT.available()) return;
+    
+    setTargets(t, -1);
+    t[F_FR] = fr_F + 30; 
+    moverGrupo(t, 250);
+    if (SerialBT.available()) return;
+  }
+  delay(500); 
+
+  setTargets(t, -1);
+  t[B_FR] = fr_B; t[F_FR] = fr_F; t[T_FR] = fr_T;
+  moverGrupo(t, 400); 
+  if (SerialBT.available()) return;
+  
+  setTargets(t, -1);
+  t[B_RR] = rr_B; 
+  t[F_RR] = rr_F; 
+  t[T_RR] = rr_T + 40; 
+  moverGrupo(t, 250);
+  if (SerialBT.available()) return;
+
+  setTargets(t, -1);
+  t[T_RR] = rr_T; 
+  moverGrupo(t, 200);
+  if (SerialBT.available()) return;
+
+  setTargets(t, -1);
+  t[B_RL] = rl_B; t[F_RL] = rl_F; t[T_RL] = rl_T;
+  moverGrupo(t, 400);
+  if (SerialBT.available()) return;
+
+  setTargets(t, -1);
+  t[B_FL] = fl_B; t[F_FL] = fl_F; t[T_FL] = fl_T;
+  moverGrupo(t, 200);
+  if (SerialBT.available()) return;
+  
+  delay(200);
+  estado = 0;
+}
+
+void trotStepRecto() {
+  int q = PERIODO / 4; int t[12];
+  setTargets(t, -1);
+  t[F_FR]=fr_F-STRIDE; t[T_FR]=fr_T-LIFT; t[F_RL]=rl_F+STRIDE; t[T_RL]=rl_T+LIFT;
+  t[F_FL]=fl_F-STRIDE; t[F_RR]=rr_F+STRIDE;
+  moverGrupo(t, q*2);
+  setTargets(t, -1); t[T_FR]=fr_T; t[T_RL]=rl_T; moverGrupo(t, q);
+  
+  setTargets(t, -1);
+  t[F_FL]=fl_F+STRIDE; t[T_FL]=fl_T+LIFT; t[F_RR]=rr_F-STRIDE; t[T_RR]=rr_T-LIFT;
+  t[F_FR]=fr_F+STRIDE; t[F_RL]=rl_F-STRIDE;
+  moverGrupo(t, q*2);
+  setTargets(t, -1); t[T_FL]=fl_T; t[T_RR]=rr_T; moverGrupo(t, q);
+}
+
+void trotStepAtras() {
+  int q = PERIODO / 4; int t[12];
+  setTargets(t, -1);
+  t[F_FR]=fr_F+STRIDE; t[T_FR]=fr_T-LIFT; t[F_RL]=rl_F-STRIDE; t[T_RL]=rl_T+LIFT;
+  t[F_FL]=fl_F+STRIDE; t[F_RR]=rr_F-STRIDE;
+  moverGrupo(t, q*2);
+  setTargets(t, -1); t[T_FR]=fr_T; t[T_RL]=rl_T; moverGrupo(t, q);
+
+  setTargets(t, -1);
+  t[F_FL]=fl_F-STRIDE; t[T_FL]=fl_T+LIFT; t[F_RR]=rr_F+STRIDE; t[T_RR]=rr_T-LIFT;
+  t[F_FR]=fr_F-STRIDE; t[F_RL]=rl_F+STRIDE;
+  moverGrupo(t, q*2);
+  setTargets(t, -1); t[T_FL]=fl_T; t[T_RR]=rr_T; moverGrupo(t, q);
+}
+
+void trotStepIzquierda() { 
+  int q = PERIODO / 4; int t[12];
+  setTargets(t, -1);
+  t[T_FR]=fr_T-LIFT; t[T_RL]=rl_T+LIFT;
+  t[F_FR]=fr_F; t[F_RL]=rl_F; 
+  t[F_FL]=fl_F; t[F_RR]=rr_F;
+  t[B_FR]=fr_B + TURN; t[B_RL]=rl_B + TURN; 
+  t[B_FL]=fl_B - TURN; t[B_RR]=rr_B - TURN; 
+  moverGrupo(t, q*2);
+  setTargets(t, -1); t[T_FR]=fr_T; t[T_RL]=rl_T; moverGrupo(t, q);
+
+  setTargets(t, -1);
+  t[T_FL]=fl_T+LIFT; t[T_RR]=rr_T-LIFT;
+  t[F_FR]=fr_F; t[F_RL]=rl_F; 
+  t[F_FL]=fl_F; t[F_RR]=rr_F;
+  t[B_FL]=fl_B + TURN; t[B_RR]=rr_B + TURN; 
+  t[B_FR]=fr_B - TURN; t[B_RL]=rl_B - TURN; 
+  moverGrupo(t, q*2);
+  setTargets(t, -1); t[T_FL]=fl_T; t[T_RR]=rr_T; moverGrupo(t, q);
+}
+
+void trotStepDerecha() { 
+  int q = PERIODO / 4; int t[12];
+  setTargets(t, -1);
+  t[T_FR]=fr_T-LIFT; t[T_RL]=rl_T+LIFT;
+  t[F_FR]=fr_F; t[F_RL]=rl_F; 
+  t[F_FL]=fl_F; t[F_RR]=rr_F;
+  t[B_FR]=fr_B - TURN; t[B_RL]=rl_B - TURN; 
+  t[B_FL]=fl_B + TURN; t[B_RR]=rr_B + TURN; 
+  moverGrupo(t, q*2);
+  setTargets(t, -1); t[T_FR]=fr_T; t[T_RL]=rl_T; moverGrupo(t, q);
+
+  setTargets(t, -1);
+  t[T_FL]=fl_T+LIFT; t[T_RR]=rr_T-LIFT;
+  t[F_FR]=fr_F; t[F_RL]=rl_F; 
+  t[F_FL]=fl_F; t[F_RR]=rr_F;
+  t[B_FL]=fl_B - TURN; t[B_RR]=rr_B - TURN; 
+  t[B_FR]=fr_B + TURN; t[B_RL]=rl_B + TURN; 
+  moverGrupo(t, q*2);
+  setTargets(t, -1); t[T_FL]=fl_T; t[T_RR]=rr_T; moverGrupo(t, q);
+}
