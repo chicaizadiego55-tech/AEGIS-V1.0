@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 <p align="center">
   <img src="Media/banner_aegis.png" alt="AEGIS EduBot Banner" width="100%">
 </p>
@@ -110,7 +111,6 @@ Firmware/AEGIS.ino
 
 Compile using Arduino IDE with ESP32 Boards installed.
 
-
 ---
 # 📄 Documentation
 
@@ -125,10 +125,10 @@ Compile using Arduino IDE with ESP32 Boards installed.
 
 ---
 
-
-
 # 👨‍💻 Developed by
 
 ISMAC – Instituto Tecnológico Universitario
 
 AEGIS EduBot © 2026
+
+
