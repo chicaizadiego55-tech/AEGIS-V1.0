@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 <p align="center">
   <img src="Media/banner_aegis.png" alt="AEGIS EduBot Banner" width="100%">
 </p>
