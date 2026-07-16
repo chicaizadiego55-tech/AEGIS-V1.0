@@ -1,7 +1,4 @@
-<<<<<<< HEAD
 
-=======
->>>>>>> c3ff44314d6e161f53debed6090114a4ad39e6cd
 <p align="center">
   <img src="Media/banner_aegis.png" alt="AEGIS EduBot Banner" width="100%">
 </p>
