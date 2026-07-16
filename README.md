@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 <p align="center">
   <img src="Media/banner_aegis.png" alt="AEGIS EduBot Banner" width="100%">
 </p>
@@ -75,25 +75,7 @@ Recognizes recyclable materials to promote environmental awareness.
 
 ---
 
-# 📂 Repository Structure
 
-```text
-AEGIS/
-│
-├── BOM/
-├── CAD/
-├── Docs/
-├── Electronics/
-├── Firmware/
-├── Media/
-├── Results/
-│
-├── .gitignore
-├── LICENSE
-└── README.md
-```
-
----
 
 # 🚀 Getting Started
 
